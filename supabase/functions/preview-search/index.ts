@@ -35,6 +35,7 @@ interface SitemapResult {
 const PREVIEW_PAGES = 3;
 const CRAWL_TIMEOUT = 8000;
 const DAILY_SCAN_LIMIT = 4;
+const DAILY_PREVIEW_LIMIT = 20;
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -258,13 +259,47 @@ Deno.serve(async (req: Request) => {
     let remainingScans = isAdmin ? 999 : DAILY_SCAN_LIMIT;
 
     if (!isAdmin) {
-      const { data: usageData } = await getUsageRecord(supabase, clientId, ipHash);
+      const { data: usageData, isClientBased } = await getUsageRecord(supabase, clientId, ipHash);
+      const resetAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
 
       if (usageData) {
         if (new Date(usageData.reset_at) <= new Date()) {
           remainingScans = DAILY_SCAN_LIMIT;
         } else {
           remainingScans = Math.max(0, DAILY_SCAN_LIMIT - usageData.scans_today);
+        }
+
+        // Preview-Limit prüfen und Zähler erhöhen
+        const previewExpired = !usageData.preview_reset_at || new Date(usageData.preview_reset_at) <= new Date();
+        const previewCount = previewExpired ? 0 : (usageData.previews_today ?? 0);
+
+        if (previewCount >= DAILY_PREVIEW_LIMIT) {
+          return new Response(
+            JSON.stringify({
+              error: 'Vorschau-Limit erreicht',
+              message: `Tägliches Vorschau-Limit von ${DAILY_PREVIEW_LIMIT} erreicht. Bitte morgen erneut versuchen.`,
+            }),
+            { status: 429, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const updateKey = isClientBased ? { client_id: clientId } : { ip_hash: ipHash };
+        await supabase.from('usage_limits').update({
+          previews_today: previewExpired ? 1 : previewCount + 1,
+          preview_reset_at: previewExpired ? resetAt : usageData.preview_reset_at,
+        }).match(updateKey);
+      } else {
+        // Neuer Nutzer – Datensatz anlegen
+        if (isClientBased) {
+          await supabase.from('usage_limits').insert({
+            client_id: clientId, scans_today: 0, reset_at: resetAt,
+            previews_today: 1, preview_reset_at: resetAt,
+          });
+        } else {
+          await supabase.from('usage_limits').insert({
+            ip_hash: ipHash, scans_today: 0, reset_at: resetAt,
+            previews_today: 1, preview_reset_at: resetAt,
+          });
         }
       }
     }
@@ -279,6 +314,13 @@ Deno.serve(async (req: Request) => {
           status: 400,
           headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' },
         }
+      );
+    }
+
+    if (query.trim().length < 2) {
+      return new Response(
+        JSON.stringify({ error: 'Suchbegriff muss mindestens 2 Zeichen lang sein' }),
+        { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
       );
     }
 

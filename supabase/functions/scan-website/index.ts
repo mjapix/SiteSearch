@@ -366,6 +366,13 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    if (query.trim().length < 2) {
+      return new Response(
+        JSON.stringify({ error: 'Suchbegriff muss mindestens 2 Zeichen lang sein' }),
+        { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
     if (query.length > 500) {
       return new Response(
         JSON.stringify({ error: 'Suchbegriff zu lang (max. 500 Zeichen)' }),

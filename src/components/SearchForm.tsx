@@ -17,6 +17,7 @@ export function SearchForm({ onPreview, isLoading, error, remainingScans }: Sear
   const [query, setQuery] = useState('');
   const [targetUrl, setTargetUrl] = useState('');
   const [showOptions, setShowOptions] = useState(false);
+  const [validationError, setValidationError] = useState<string | null>(null);
   const [options, setOptions] = useState<SearchOptions>({
     exactPhrase: true,
     caseSensitive: false,
@@ -24,6 +25,11 @@ export function SearchForm({ onPreview, isLoading, error, remainingScans }: Sear
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (query.trim().length < 2) {
+      setValidationError('Suchbegriff muss mindestens 2 Zeichen lang sein.');
+      return;
+    }
+    setValidationError(null);
     if (query.trim() && targetUrl.trim()) {
       onPreview(query.trim(), targetUrl.trim(), options);
     }
@@ -157,6 +163,13 @@ export function SearchForm({ onPreview, isLoading, error, remainingScans }: Sear
             )}
           </div>
 
+          {validationError && (
+            <div className="flex items-start gap-3 p-4 bg-red-50 border border-red-100 rounded-xl">
+              <AlertCircle className="w-5 h-5 text-red-500 flex-shrink-0 mt-0.5" />
+              <p className="text-sm text-red-700">{validationError}</p>
+            </div>
+          )}
+
           {error && (
             <div className="flex items-start gap-3 p-4 bg-red-50 border border-red-100 rounded-xl">
               <AlertCircle className="w-5 h-5 text-red-500 flex-shrink-0 mt-0.5" />
@@ -166,7 +179,7 @@ export function SearchForm({ onPreview, isLoading, error, remainingScans }: Sear
 
           <button
             type="submit"
-            disabled={isLoading || !query.trim() || !targetUrl.trim()}
+            disabled={isLoading || query.trim().length < 2 || !targetUrl.trim()}
             className="w-full py-4 bg-gradient-to-r from-teal-500 to-emerald-600 text-white font-semibold rounded-xl shadow-lg shadow-teal-500/30 hover:shadow-xl hover:shadow-teal-500/40 hover:from-teal-600 hover:to-emerald-700 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:shadow-lg transition-all duration-200 flex items-center justify-center gap-2"
           >
             {isLoading ? (
