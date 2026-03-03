@@ -158,3 +158,119 @@ supabase/
 - **Admin-Token:** Sicheres, zufälliges Passwort wählen (min. 20 Zeichen empfohlen)
 - **Migrations:** Alle drei Migrations müssen ausgeführt sein, sonst funktioniert das Preview-Rate-Limiting nicht
 - **Secrets:** `.env`-Datei niemals ins Git-Repository committen
+
+---
+
+## Behobene Sicherheitslücken
+
+Dieser Abschnitt dokumentiert alle Schwachstellen, die im Rahmen einer Security-Analyse identifiziert und behoben wurden.
+
+---
+
+### KRITISCH
+
+#### SSRF — Server-Side Request Forgery
+**Behoben in:** `supabase/functions/scan-website/index.ts`, `supabase/functions/preview-search/index.ts`
+
+**Problem:** Die Edge Functions haben beliebige User-URLs ohne Validierung gefetcht. Ein Angreifer konnte damit interne Dienste anscannen, z.B.:
+- `http://169.254.169.254/latest/meta-data/` → AWS-Zugangsdaten
+- `http://192.168.1.1/admin` → Internes Netzwerk
+- `http://localhost:5432` → Datenbankports
+
+**Fix:** Funktion `isSafeUrl()` blockiert jetzt vor jedem `fetch()`-Aufruf:
+- Nur `http://` und `https://` erlaubt
+- Geblockt: `localhost`, `0.0.0.0`, `::1`
+- Geblockt: Private IP-Ranges (`10.x.x.x`, `172.16–31.x.x`, `192.168.x.x`, `127.x.x.x`)
+- Geblockt: Cloud-Metadata-Endpoints (`169.254.169.254`, `metadata.google.internal`)
+
+---
+
+### HOCH
+
+#### CORS — Wildcard-Origin
+**Behoben in:** Allen 3 Edge Functions
+
+**Problem:** `Access-Control-Allow-Origin: *` erlaubte jeder beliebigen Website, Requests an die API zu senden — kombiniert mit einem gestohlenen Admin-Token war ein CSRF-Angriff möglich.
+
+**Fix:** Origin wird jetzt aus der Umgebungsvariable `ALLOWED_ORIGIN` gelesen. Wenn gesetzt, werden nur Requests von dieser Domain akzeptiert.
+
+---
+
+#### Fehlende Security Headers
+**Behoben in:** Allen 3 Edge Functions
+
+**Problem:** Responses enthielten keine HTTP-Sicherheitsheader, was Clickjacking und MIME-Sniffing ermöglichte.
+
+**Fix:** Alle Responses senden jetzt:
+| Header | Wert | Schutz vor |
+|--------|------|-----------|
+| `X-Content-Type-Options` | `nosniff` | MIME-Sniffing |
+| `X-Frame-Options` | `DENY` | Clickjacking |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` | Referrer-Leakage |
+
+---
+
+#### Interne Fehlermeldungen nach außen
+**Behoben in:** Allen 3 Edge Functions
+
+**Problem:** `error.message` wurde direkt an den Client zurückgegeben und konnte interne Stack-Informationen, Dateinamen oder Datenbankdetails preisgeben.
+
+**Fix:** Alle Catch-Blöcke geben jetzt nur generische Texte zurück (`"Ein unerwarteter Fehler ist aufgetreten"`). Der vollständige Fehler wird nur server-seitig geloggt.
+
+---
+
+### MITTEL
+
+#### Input-Validierung fehlend
+**Behoben in:** `scan-website`, `preview-search` (Server), `SearchForm.tsx` (Client)
+
+**Problem:** Keine Längenprüfung auf Query und URL — extrem lange Eingaben konnten zu ReDoS (Regex Denial of Service) oder überlasteten Requests führen.
+
+**Fix:**
+- Suchbegriff: min. 2 Zeichen, max. 500 Zeichen
+- Ziel-URL: max. 2048 Zeichen
+- Frontend: Button deaktiviert bei Unterschreitung, Fehlermeldung im UI
+- Server: HTTP 400 bei Verletzung der Grenzen
+
+---
+
+#### IP-Hash auf 32 Zeichen abgeschnitten
+**Behoben in:** Allen 3 Edge Functions
+
+**Problem:** Der SHA-256-Hash (64 Hex-Zeichen) wurde auf 32 Zeichen gekürzt — das erhöht die Kollisionswahrscheinlichkeit und könnte zwei verschiedene IPs auf denselben Hash mappen (Rate-Limit-Bypass).
+
+**Fix:** Vollständiger 64-Zeichen SHA-256-Hash wird verwendet.
+
+---
+
+#### Admin-Token ohne Ablaufzeit
+**Behoben in:** `src/lib/supabase.ts`
+
+**Problem:** Der Admin-Token wurde als Plain-Text dauerhaft in `localStorage` gespeichert — kein Ablaufdatum, kein Schutz gegen langlebige Token-Diebstähle.
+
+**Fix:** Token wird als JSON-Objekt `{ token, expiresAt }` gespeichert und läuft automatisch nach **4 Stunden** ab. Abgelaufene Token werden beim nächsten Lesen automatisch gelöscht.
+
+---
+
+#### Preview-Endpoint ohne Rate-Limiting
+**Behoben in:** `supabase/functions/preview-search/index.ts`, Migration `003`
+
+**Problem:** Der `/preview-search`-Endpunkt hatte kein Limit — ein Angreifer konnte beliebig viele Vorschauen starten und damit Server-Ressourcen (CPU, Bandbreite, Supabase-Quota) ausschöpfen.
+
+**Fix:**
+- Neues DB-Schema: Spalten `previews_today` und `preview_reset_at` in `usage_limits`
+- Limit: max. **20 Vorschauen pro Tag** pro Client (5× das Scan-Limit)
+- HTTP 429 bei Überschreitung
+- Neue Nutzer bekommen beim ersten Preview automatisch einen Datensatz angelegt
+
+---
+
+### Bekannte offene Punkte
+
+Folgende Risiken wurden bewusst nicht geändert, da sie entweder Design-Entscheidungen sind oder tiefgreifende Refactorings erfordern:
+
+| Risiko | Grund offen |
+|--------|------------|
+| Admin-Token in `localStorage` (nicht verschlüsselt) | Erfordert komplettes Auth-System (z.B. Supabase Auth mit httpOnly-Cookies) |
+| Rate-Limit via Client-UUID umgehbar | Bewusstes Design: Nutzer im selben Netzwerk sollen eigene Limits haben (Migration 002) |
+| Scan-Sessions ohne Eigentümer-Prüfung lesbar | Intentionales Feature für die Ergebnis-Sharing-Funktion |
