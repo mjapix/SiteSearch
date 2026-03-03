@@ -83,6 +83,7 @@ export function SearchForm({ onPreview, isLoading, error, remainingScans }: Sear
                 placeholder="z.B. Datenschutz, Cookie-Richtlinie, Kontakt..."
                 className="w-full pl-12 pr-4 py-3.5 bg-gray-50 border border-gray-200 rounded-xl text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:border-transparent transition-all"
                 disabled={isLoading}
+                maxLength={500}
                 autoFocus
               />
             </div>
@@ -102,6 +103,7 @@ export function SearchForm({ onPreview, isLoading, error, remainingScans }: Sear
                 placeholder="z.B. example.com oder example.com/sitemap.xml"
                 className="w-full pl-12 pr-4 py-3.5 bg-gray-50 border border-gray-200 rounded-xl text-gray-900 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:border-transparent transition-all"
                 disabled={isLoading}
+                maxLength={2048}
               />
             </div>
             <p className="text-xs text-gray-400 mt-2">

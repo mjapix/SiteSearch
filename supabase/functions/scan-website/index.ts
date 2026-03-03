@@ -2,9 +2,15 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
 const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin": Deno.env.get('ALLOWED_ORIGIN') ?? '*',
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey, x-admin-token, x-client-id",
+};
+
+const securityHeaders = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
 };
 
 interface ScanRequest {
@@ -63,6 +69,23 @@ function extractDomain(url: string): string {
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function isSafeUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    const h = parsed.hostname.toLowerCase();
+    if (h === 'localhost' || h === '0.0.0.0' || h === '::1') return false;
+    if (h === '169.254.169.254' || h === 'metadata.google.internal' || h === 'metadata.goog') return false;
+    if (/^127\./.test(h)) return false;
+    if (/^10\./.test(h)) return false;
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return false;
+    if (/^192\.168\./.test(h)) return false;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function extractContextSnippet(text: string, query: string, caseSensitive: boolean, maxLength = 300): string {
@@ -132,6 +155,9 @@ function extractLinks(html: string, baseUrl: string, targetDomain: string): stri
 }
 
 async function fetchPage(url: string, allowText = false): Promise<{ html: string; ok: boolean; finalUrl: string }> {
+  if (!isSafeUrl(url)) {
+    return { html: '', ok: false, finalUrl: url };
+  }
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), CRAWL_TIMEOUT);
@@ -242,7 +268,7 @@ async function hashIp(ip: string): Promise<string> {
   const data = encoder.encode(ip + 'salt-for-privacy');
   const hashBuffer = await crypto.subtle.digest('SHA-256', data);
   const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 32);
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 async function getUsageRecord(supabase: ReturnType<typeof createClient>, clientId: string | null, ipHash: string) {
@@ -271,7 +297,7 @@ Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, {
       status: 200,
-      headers: corsHeaders,
+      headers: { ...corsHeaders, ...securityHeaders },
     });
   }
 
@@ -306,7 +332,7 @@ Deno.serve(async (req: Request) => {
               message: `Du hast dein taegliches Limit von ${DAILY_SCAN_LIMIT} Scans erreicht. Versuche es morgen erneut.`,
               resetAt: usageData.reset_at,
             }),
-            { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+            { status: 429, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
           );
         } else {
           const updateKey = isClientBased ? { client_id: clientId } : { ip_hash: ipHash };
@@ -335,8 +361,22 @@ Deno.serve(async (req: Request) => {
         JSON.stringify({ error: 'Fehlende Pflichtfelder: query und targetUrl' }),
         {
           status: 400,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' },
         }
+      );
+    }
+
+    if (query.length > 500) {
+      return new Response(
+        JSON.stringify({ error: 'Suchbegriff zu lang (max. 500 Zeichen)' }),
+        { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    if (targetUrl.length > 2048) {
+      return new Response(
+        JSON.stringify({ error: 'URL zu lang (max. 2048 Zeichen)' }),
+        { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
@@ -791,7 +831,7 @@ Deno.serve(async (req: Request) => {
           console.error('Scan error:', error);
           sendEvent(controller, {
             type: 'error',
-            message: error instanceof Error ? error.message : 'Unbekannter Fehler'
+            message: 'Ein unerwarteter Fehler ist aufgetreten'
           });
           controller.close();
         }
@@ -801,6 +841,7 @@ Deno.serve(async (req: Request) => {
     return new Response(stream, {
       headers: {
         ...corsHeaders,
+        ...securityHeaders,
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
@@ -812,11 +853,11 @@ Deno.serve(async (req: Request) => {
     return new Response(
       JSON.stringify({
         error: 'Scan fehlgeschlagen',
-        message: error instanceof Error ? error.message : 'Unbekannter Fehler',
+        message: 'Ein unerwarteter Fehler ist aufgetreten',
       }),
       {
         status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' },
       }
     );
   }
