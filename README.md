@@ -169,7 +169,7 @@ Dieser Abschnitt dokumentiert alle Schwachstellen, die im Rahmen einer Security-
 
 ### KRITISCH
 
-#### SSRF — Server-Side Request Forgery
+#### SSRF — Server-Side Request Forgery (Direktzugriff)
 **Behoben in:** `supabase/functions/scan-website/index.ts`, `supabase/functions/preview-search/index.ts`
 
 **Problem:** Die Edge Functions haben beliebige User-URLs ohne Validierung gefetcht. Ein Angreifer konnte damit interne Dienste anscannen, z.B.:
@@ -185,7 +185,86 @@ Dieser Abschnitt dokumentiert alle Schwachstellen, die im Rahmen einer Security-
 
 ---
 
+#### SSRF — via Open Redirect (Umgehung durch Weiterleitung)
+**Behoben in:** `supabase/functions/scan-website/index.ts`, `supabase/functions/preview-search/index.ts`
+**Kein Migration erforderlich** — reine Code-Änderung
+
+**Problem:** `isSafeUrl()` prüfte nur die ursprüngliche URL, nicht die Ziel-URL nach HTTP-Redirects. Ein Angreifer konnte eine Website unter seiner Kontrolle hosten, die mit `301 Location: http://169.254.169.254/...` antwortet — die SSRF-Schutzfunktion wurde damit vollständig umgangen.
+
+**Fix:** In `fetchPage()` wird nach dem `fetch()` zusätzlich `response.url` (die finale URL nach allen Weiterleitungen) gegen `isSafeUrl()` geprüft. Weiterleitung auf eine interne Adresse → Request wird verworfen.
+
+```typescript
+// Vorher: nur die initiale URL wurde geprüft
+if (!isSafeUrl(url)) { ... }
+const response = await fetch(url, { redirect: 'follow' });
+const html = await response.text(); // ← Inhalt der internen URL!
+
+// Nachher: auch die finale URL nach Redirects wird geprüft
+if (!isSafeUrl(url)) { ... }
+const response = await fetch(url, { redirect: 'follow' });
+if (!isSafeUrl(response.url)) { return { ok: false, ... }; } // ← Neu
+```
+
+---
+
+#### Rate-Limiting-Bypass via X-Forwarded-For Spoofing
+**Behoben in:** Allen 3 Edge Functions (`scan-website`, `preview-search`, `check-limit`)
+**Kein Migration erforderlich** — reine Code-Änderung
+
+**Problem:** Die IP-Erkennung las `x-forwarded-for` als erste Wahl aus. Dieser Header ist vollständig vom Client kontrollierbar — jeder konnte durch Setzen eines beliebigen `x-forwarded-for`-Wertes eine neue Identität annehmen und das Scan-Limit beliebig oft zurücksetzen:
+
+```
+x-forwarded-for: 1.2.3.4    # Hash A → Limit verbraucht
+x-forwarded-for: 5.6.7.8    # Hash B → Limit neu
+x-forwarded-for: 9.10.11.12 # Hash C → Limit neu ...
+```
+
+**Fix:** `cf-connecting-ip` wird jetzt priorisiert. Dieser Header wird von Cloudflare selbst gesetzt und kann vom Client nicht gefälscht werden. `x-forwarded-for` dient nur noch als letzter Fallback, wobei der letzte Eintrag (vom vertrauenswürdigsten Proxy gesetzt) statt dem ersten (vom Client setzbaren) Eintrag verwendet wird.
+
+```typescript
+// Vorher (spoofbar):
+req.headers.get('x-forwarded-for')?.split(',')[0] || req.headers.get('cf-connecting-ip')
+
+// Nachher (sicher):
+req.headers.get('cf-connecting-ip') ||
+req.headers.get('x-forwarded-for')?.split(',').at(-1)?.trim()
+```
+
+---
+
 ### HOCH
+
+#### Sitemap-Missbrauch als Web-Proxy (Domain-Filter fehlend)
+**Behoben in:** `supabase/functions/scan-website/index.ts`, `supabase/functions/preview-search/index.ts`
+**Kein Migration erforderlich** — reine Code-Änderung
+
+**Problem:** `parseSitemap()` akzeptierte `<loc>`-Einträge aus beliebigen Domains. Ein Angreifer konnte eine Sitemap auf einer eigenen Domain hosten, die Hunderte URLs von fremden Websites (Konkurrenz, Behörden, kritische Infrastruktur) enthält, und das Tool dazu bringen, diese alle zu crawlen — von der Supabase-IP aus, ohne dass der Nutzer oder der Betreiber davon weiß.
+
+Gleichzeitig fehlte in `preview-search` ein `maxDepth`-Limit: Eine bösartige Sitemap mit unbegrenzter Verschachtelung konnte rekursiv endlos viele Sub-Sitemaps nachladen.
+
+**Fix:**
+1. In `parseSitemap()` wird jede `<loc>`-URL gegen die Ziel-Domain geprüft. Einträge, die auf fremde Domains zeigen, werden still ignoriert.
+2. `preview-search/parseSitemap()` hat jetzt denselben `maxDepth = 2`-Parameter wie `scan-website`.
+
+```typescript
+// Neu in parseSitemap():
+const locDomain = extractDomain(loc);
+if (!locDomain || locDomain !== domain) continue; // Fremde Domains ignorieren
+```
+
+---
+
+#### Unbegrenzte HTTP-Antwortgröße (Memory Exhaustion)
+**Behoben in:** `supabase/functions/scan-website/index.ts`, `supabase/functions/preview-search/index.ts`
+**Kein Migration erforderlich** — reine Code-Änderung
+
+**Problem:** `fetchPage()` pufferte die gesamte HTTP-Antwort ungefiltert mit `response.text()` im RAM. Edge Functions haben ein Speicherlimit (~150 MB). Eine gezielt präparierte Seite mit einer sehr großen Antwort konnte die Function zum Absturz bringen.
+
+**Fix:** Zweistufiges Limit von 5 MB:
+1. `Content-Length`-Header wird vorab geprüft — Antworten mit bekannter Größe > 5 MB werden gar nicht erst gelesen.
+2. Nach `response.text()` wird der Text auf 5 MB abgeschnitten (`html.slice(0, MAX_BODY_SIZE)`).
+
+---
 
 #### CORS — Wildcard-Origin
 **Behoben in:** Allen 3 Edge Functions
@@ -274,3 +353,5 @@ Folgende Risiken wurden bewusst nicht geändert, da sie entweder Design-Entschei
 | Admin-Token in `localStorage` (nicht verschlüsselt) | Erfordert komplettes Auth-System (z.B. Supabase Auth mit httpOnly-Cookies) |
 | Rate-Limit via Client-UUID umgehbar | Bewusstes Design: Nutzer im selben Netzwerk sollen eigene Limits haben (Migration 002) |
 | Scan-Sessions ohne Eigentümer-Prüfung lesbar | Intentionales Feature für die Ergebnis-Sharing-Funktion |
+
+> **Hinweis:** Die Lücken SSRF via Open Redirect, X-Forwarded-For Spoofing, Sitemap-Domain-Filter und unbegrenzte Antwortgröße wurden in einem zweiten Fix-Durchlauf (2026-03-03) behoben. Sie erfordern **keine neue SQL-Migration** — nur ein erneutes Deployen der Edge Functions.
