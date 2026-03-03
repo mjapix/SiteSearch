@@ -20,9 +20,11 @@ async function getIdentifier(req: Request): Promise<string> {
   if (clientId && clientId.length > 8) {
     return `client:${clientId}`;
   }
+  // Prefer cf-connecting-ip (set by Cloudflare, cannot be spoofed by clients)
+  // x-forwarded-for is client-controlled and must not be trusted for rate limiting
   const ip =
-    req.headers.get("x-forwarded-for")?.split(",")[0] ||
     req.headers.get("cf-connecting-ip") ||
+    req.headers.get("x-forwarded-for")?.split(",").at(-1)?.trim() ||
     "unknown";
   const encoder = new TextEncoder();
   const data = encoder.encode(ip + "salt-for-privacy-preview");

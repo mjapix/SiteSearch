@@ -121,6 +121,8 @@ function extractDomain(url: string): string {
   }
 }
 
+const MAX_BODY_SIZE = 5 * 1024 * 1024; // 5 MB
+
 async function fetchPage(url: string): Promise<{ html: string; ok: boolean; finalUrl: string }> {
   if (!isSafeUrl(url)) {
     return { html: '', ok: false, finalUrl: url };
@@ -140,19 +142,32 @@ async function fetchPage(url: string): Promise<{ html: string; ok: boolean; fina
 
     clearTimeout(timeoutId);
 
+    // Re-check URL after following redirects to prevent SSRF via open redirect
+    if (!isSafeUrl(response.url)) {
+      return { html: '', ok: false, finalUrl: url };
+    }
+
     if (!response.ok) {
       return { html: '', ok: false, finalUrl: url };
     }
 
+    // Reject oversized responses before buffering to prevent memory exhaustion
+    const contentLength = response.headers.get('content-length');
+    if (contentLength && parseInt(contentLength, 10) > MAX_BODY_SIZE) {
+      return { html: '', ok: false, finalUrl: response.url };
+    }
+
     const html = await response.text();
     const finalUrl = response.url || url;
-    return { html, ok: true, finalUrl };
+    return { html: html.slice(0, MAX_BODY_SIZE), ok: true, finalUrl };
   } catch {
     return { html: '', ok: false, finalUrl: url };
   }
 }
 
-async function parseSitemap(url: string, domain: string): Promise<SitemapResult> {
+async function parseSitemap(url: string, domain: string, maxDepth = 2): Promise<SitemapResult> {
+  if (maxDepth <= 0) return { urls: [], isSitemap: false };
+
   try {
     const { html, ok } = await fetchPage(url);
     if (!ok) return { urls: [], isSitemap: false };
@@ -164,8 +179,12 @@ async function parseSitemap(url: string, domain: string): Promise<SitemapResult>
 
       while ((match = locRegex.exec(html)) !== null) {
         const loc = match[1].trim();
+        // Only process URLs that belong to the target domain to prevent proxy abuse
+        const locDomain = extractDomain(loc);
+        if (!locDomain || locDomain !== domain) continue;
+
         if (loc.endsWith('.xml')) {
-          const nestedResult = await parseSitemap(loc, domain);
+          const nestedResult = await parseSitemap(loc, domain, maxDepth - 1);
           urls.push(...nestedResult.urls);
         } else {
           urls.push(normalizeUrl(loc));
@@ -250,8 +269,10 @@ Deno.serve(async (req: Request) => {
     const adminSecret = Deno.env.get('ADMIN_SECRET');
     const isAdmin = adminSecret && adminToken === adminSecret;
 
-    const clientIp = req.headers.get('x-forwarded-for')?.split(',')[0] ||
-                     req.headers.get('cf-connecting-ip') ||
+    // Prefer cf-connecting-ip (set by Cloudflare, cannot be spoofed by clients)
+    // x-forwarded-for is client-controlled and must not be trusted for rate limiting
+    const clientIp = req.headers.get('cf-connecting-ip') ||
+                     req.headers.get('x-forwarded-for')?.split(',').at(-1)?.trim() ||
                      'unknown';
     const ipHash = await hashIp(clientIp);
     const clientId = req.headers.get('x-client-id');
