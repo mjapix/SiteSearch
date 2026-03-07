@@ -2,9 +2,15 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
 const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin": Deno.env.get('ALLOWED_ORIGIN') ?? '*',
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey, x-admin-token, x-client-id",
+};
+
+const securityHeaders = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
 };
 
 interface PreviewRequest {
@@ -29,9 +35,27 @@ interface SitemapResult {
 const PREVIEW_PAGES = 3;
 const CRAWL_TIMEOUT = 8000;
 const DAILY_SCAN_LIMIT = 4;
+const DAILY_PREVIEW_LIMIT = 20;
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function isSafeUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+    const h = parsed.hostname.toLowerCase();
+    if (h === 'localhost' || h === '0.0.0.0' || h === '::1') return false;
+    if (h === '169.254.169.254' || h === 'metadata.google.internal' || h === 'metadata.goog') return false;
+    if (/^127\./.test(h)) return false;
+    if (/^10\./.test(h)) return false;
+    if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return false;
+    if (/^192\.168\./.test(h)) return false;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function extractContextSnippet(text: string, query: string, caseSensitive: boolean, maxLength = 300): string {
@@ -97,7 +121,12 @@ function extractDomain(url: string): string {
   }
 }
 
+const MAX_BODY_SIZE = 5 * 1024 * 1024; // 5 MB
+
 async function fetchPage(url: string): Promise<{ html: string; ok: boolean; finalUrl: string }> {
+  if (!isSafeUrl(url)) {
+    return { html: '', ok: false, finalUrl: url };
+  }
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), CRAWL_TIMEOUT);
@@ -113,19 +142,32 @@ async function fetchPage(url: string): Promise<{ html: string; ok: boolean; fina
 
     clearTimeout(timeoutId);
 
+    // Re-check URL after following redirects to prevent SSRF via open redirect
+    if (!isSafeUrl(response.url)) {
+      return { html: '', ok: false, finalUrl: url };
+    }
+
     if (!response.ok) {
       return { html: '', ok: false, finalUrl: url };
     }
 
+    // Reject oversized responses before buffering to prevent memory exhaustion
+    const contentLength = response.headers.get('content-length');
+    if (contentLength && parseInt(contentLength, 10) > MAX_BODY_SIZE) {
+      return { html: '', ok: false, finalUrl: response.url };
+    }
+
     const html = await response.text();
     const finalUrl = response.url || url;
-    return { html, ok: true, finalUrl };
+    return { html: html.slice(0, MAX_BODY_SIZE), ok: true, finalUrl };
   } catch {
     return { html: '', ok: false, finalUrl: url };
   }
 }
 
-async function parseSitemap(url: string, domain: string): Promise<SitemapResult> {
+async function parseSitemap(url: string, domain: string, maxDepth = 2): Promise<SitemapResult> {
+  if (maxDepth <= 0) return { urls: [], isSitemap: false };
+
   try {
     const { html, ok } = await fetchPage(url);
     if (!ok) return { urls: [], isSitemap: false };
@@ -137,8 +179,12 @@ async function parseSitemap(url: string, domain: string): Promise<SitemapResult>
 
       while ((match = locRegex.exec(html)) !== null) {
         const loc = match[1].trim();
+        // Only process URLs that belong to the target domain to prevent proxy abuse
+        const locDomain = extractDomain(loc);
+        if (!locDomain || locDomain !== domain) continue;
+
         if (loc.endsWith('.xml')) {
-          const nestedResult = await parseSitemap(loc, domain);
+          const nestedResult = await parseSitemap(loc, domain, maxDepth - 1);
           urls.push(...nestedResult.urls);
         } else {
           urls.push(normalizeUrl(loc));
@@ -193,7 +239,7 @@ async function hashIp(ip: string): Promise<string> {
   const data = encoder.encode(ip + 'salt-for-privacy-preview');
   const hashBuffer = await crypto.subtle.digest('SHA-256', data);
   const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 32);
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
 async function getUsageRecord(supabase: ReturnType<typeof createClient>, clientId: string | null, ipHash: string) {
@@ -209,7 +255,7 @@ Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, {
       status: 200,
-      headers: corsHeaders,
+      headers: { ...corsHeaders, ...securityHeaders },
     });
   }
 
@@ -223,8 +269,10 @@ Deno.serve(async (req: Request) => {
     const adminSecret = Deno.env.get('ADMIN_SECRET');
     const isAdmin = adminSecret && adminToken === adminSecret;
 
-    const clientIp = req.headers.get('x-forwarded-for')?.split(',')[0] ||
-                     req.headers.get('cf-connecting-ip') ||
+    // Prefer cf-connecting-ip (set by Cloudflare, cannot be spoofed by clients)
+    // x-forwarded-for is client-controlled and must not be trusted for rate limiting
+    const clientIp = req.headers.get('cf-connecting-ip') ||
+                     req.headers.get('x-forwarded-for')?.split(',').at(-1)?.trim() ||
                      'unknown';
     const ipHash = await hashIp(clientIp);
     const clientId = req.headers.get('x-client-id');
@@ -232,13 +280,47 @@ Deno.serve(async (req: Request) => {
     let remainingScans = isAdmin ? 999 : DAILY_SCAN_LIMIT;
 
     if (!isAdmin) {
-      const { data: usageData } = await getUsageRecord(supabase, clientId, ipHash);
+      const { data: usageData, isClientBased } = await getUsageRecord(supabase, clientId, ipHash);
+      const resetAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
 
       if (usageData) {
         if (new Date(usageData.reset_at) <= new Date()) {
           remainingScans = DAILY_SCAN_LIMIT;
         } else {
           remainingScans = Math.max(0, DAILY_SCAN_LIMIT - usageData.scans_today);
+        }
+
+        // Preview-Limit prüfen und Zähler erhöhen
+        const previewExpired = !usageData.preview_reset_at || new Date(usageData.preview_reset_at) <= new Date();
+        const previewCount = previewExpired ? 0 : (usageData.previews_today ?? 0);
+
+        if (previewCount >= DAILY_PREVIEW_LIMIT) {
+          return new Response(
+            JSON.stringify({
+              error: 'Vorschau-Limit erreicht',
+              message: `Tägliches Vorschau-Limit von ${DAILY_PREVIEW_LIMIT} erreicht. Bitte morgen erneut versuchen.`,
+            }),
+            { status: 429, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
+          );
+        }
+
+        const updateKey = isClientBased ? { client_id: clientId } : { ip_hash: ipHash };
+        await supabase.from('usage_limits').update({
+          previews_today: previewExpired ? 1 : previewCount + 1,
+          preview_reset_at: previewExpired ? resetAt : usageData.preview_reset_at,
+        }).match(updateKey);
+      } else {
+        // Neuer Nutzer – Datensatz anlegen
+        if (isClientBased) {
+          await supabase.from('usage_limits').insert({
+            client_id: clientId, scans_today: 0, reset_at: resetAt,
+            previews_today: 1, preview_reset_at: resetAt,
+          });
+        } else {
+          await supabase.from('usage_limits').insert({
+            ip_hash: ipHash, scans_today: 0, reset_at: resetAt,
+            previews_today: 1, preview_reset_at: resetAt,
+          });
         }
       }
     }
@@ -248,11 +330,32 @@ Deno.serve(async (req: Request) => {
 
     if (!query || !targetUrl) {
       return new Response(
-        JSON.stringify({ error: 'Missing required fields: query and targetUrl' }),
+        JSON.stringify({ error: 'Fehlende Pflichtfelder: query und targetUrl' }),
         {
           status: 400,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' },
         }
+      );
+    }
+
+    if (query.trim().length < 2) {
+      return new Response(
+        JSON.stringify({ error: 'Suchbegriff muss mindestens 2 Zeichen lang sein' }),
+        { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    if (query.length > 500) {
+      return new Response(
+        JSON.stringify({ error: 'Suchbegriff zu lang (max. 500 Zeichen)' }),
+        { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
+    if (targetUrl.length > 2048) {
+      return new Response(
+        JSON.stringify({ error: 'URL zu lang (max. 2048 Zeichen)' }),
+        { status: 400, headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' } }
       );
     }
 
@@ -264,10 +367,10 @@ Deno.serve(async (req: Request) => {
     const targetDomain = extractDomain(normalizedTargetUrl);
     if (!targetDomain) {
       return new Response(
-        JSON.stringify({ error: 'Invalid URL provided' }),
+        JSON.stringify({ error: 'Ungueltige URL angegeben' }),
         {
           status: 400,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' },
         }
       );
     }
@@ -410,7 +513,7 @@ Deno.serve(async (req: Request) => {
         },
       }),
       {
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' },
       }
     );
 
@@ -418,12 +521,12 @@ Deno.serve(async (req: Request) => {
     console.error('Preview error:', error);
     return new Response(
       JSON.stringify({
-        error: 'Preview failed',
-        message: error instanceof Error ? error.message : 'Unknown error occurred',
+        error: 'Vorschau fehlgeschlagen',
+        message: 'Ein unerwarteter Fehler ist aufgetreten',
       }),
       {
         status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        headers: { ...corsHeaders, ...securityHeaders, 'Content-Type': 'application/json' },
       }
     );
   }

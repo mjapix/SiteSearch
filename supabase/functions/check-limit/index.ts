@@ -2,9 +2,15 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
 const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Origin": Deno.env.get('ALLOWED_ORIGIN') ?? '*',
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey, x-admin-token, x-client-id",
+};
+
+const securityHeaders = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
 };
 
 const DAILY_SCAN_LIMIT = 4;
@@ -14,20 +20,22 @@ async function getIdentifier(req: Request): Promise<string> {
   if (clientId && clientId.length > 8) {
     return `client:${clientId}`;
   }
+  // Prefer cf-connecting-ip (set by Cloudflare, cannot be spoofed by clients)
+  // x-forwarded-for is client-controlled and must not be trusted for rate limiting
   const ip =
-    req.headers.get("x-forwarded-for")?.split(",")[0] ||
     req.headers.get("cf-connecting-ip") ||
+    req.headers.get("x-forwarded-for")?.split(",").at(-1)?.trim() ||
     "unknown";
   const encoder = new TextEncoder();
   const data = encoder.encode(ip + "salt-for-privacy-preview");
   const hashBuffer = await crypto.subtle.digest("SHA-256", data);
   const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return `ip:${hashArray.map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32)}`;
+  return `ip:${hashArray.map((b) => b.toString(16).padStart(2, "0")).join("")}`;
 }
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
-    return new Response(null, { status: 200, headers: corsHeaders });
+    return new Response(null, { status: 200, headers: { ...corsHeaders, ...securityHeaders } });
   }
 
   try {
@@ -43,7 +51,7 @@ Deno.serve(async (req: Request) => {
     if (isAdmin) {
       return new Response(
         JSON.stringify({ remainingScans: 999, isAdmin: true }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        { headers: { ...corsHeaders, ...securityHeaders, "Content-Type": "application/json" } }
       );
     }
 
@@ -81,15 +89,15 @@ Deno.serve(async (req: Request) => {
 
     return new Response(
       JSON.stringify({ remainingScans, isAdmin: false }),
-      { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      { headers: { ...corsHeaders, ...securityHeaders, "Content-Type": "application/json" } }
     );
   } catch (error) {
     console.error("check-limit error:", error);
     return new Response(
-      JSON.stringify({ error: "Failed to check limit" }),
+      JSON.stringify({ error: "Limit-Abfrage fehlgeschlagen" }),
       {
         status: 500,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
+        headers: { ...corsHeaders, ...securityHeaders, "Content-Type": "application/json" },
       }
     );
   }
